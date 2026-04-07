@@ -1,0 +1,36 @@
+{
+  "name": "netfixer",
+  "version": "0.6.0",
+  "description": "Adaptive network-aware request scheduler for the web",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "network",
+    "fetch",
+    "scheduler",
+    "offline",
+    "adaptive",
+    "priority"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "netfixer": "^0.5.0"
+  }
+}
