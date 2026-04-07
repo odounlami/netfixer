@@ -17,6 +17,15 @@ export interface NetworkMonitorOptions {
     pingIntervalMs?: number;
     pingTimeoutMs?: number;
     thresholds?: Partial<NetworkThresholds>;
+    /**
+     * Active les logs de debug dans la console.
+     */
+    logging?: boolean;
+    /**
+     * Nombre de pings HEAD consécutifs avant un GET complet (recalibrage du débit).
+     * Défaut : 6 — soit un GET toutes les 30s avec un interval de 5s.
+     */
+    downlinkResampleEvery?: number;
 }
 type Listener = (info: NetworkInfo) => void;
 export declare class NetworkMonitor {
@@ -24,11 +33,17 @@ export declare class NetworkMonitor {
     private firstEvaluationDone;
     private isRunning;
     private warmupDone;
+    private isEvaluating;
+    private evaluateDebounceTimer;
     private evaluationController;
+    private probeCount;
+    private lastKnownDownlink;
+    private readonly downlinkResampleEvery;
     private readonly listeners;
     private pingInterval;
     private readonly baseline;
     private readonly thresholds;
+    private readonly loggingEnabled;
     private readonly pingUrl;
     private readonly pingIntervalMs;
     private readonly pingTimeoutMs;
@@ -42,23 +57,32 @@ export declare class NetworkMonitor {
     getState(): NetworkState;
     getInfo(): NetworkInfo;
     /**
-     * Lance WARMUP_COUNT pings rapides espacés de WARMUP_INTERVAL_MS.
-     * Permet d'établir une baseline EWMA fiable en ~2s au lieu d'attendre
-     * le premier intervalle normal (5s par défaut).
+     * Point d'entrée unique pour tous les handlers d'événements.
+     * Absorbe les rafales (online + connection change simultanés) via un debounce 50ms.
      */
+    private scheduleEvaluate;
     private runWarmup;
     private wait;
+    /**
+     * [Fix 1] Guard isEvaluating : empêche les évaluations concurrentes
+     * même si les AbortControllers annulent les requêtes fetch en vol.
+     */
     private evaluate;
     /**
-     * Mesure latence (TTFB) et débit réel en une seule requête GET.
-     * Universel — fonctionne sur tous les navigateurs sans navigator.connection.
-     * L'endpoint doit servir un fichier statique léger (1–20 KB) avec CORS configuré.
+     * Mesure la latence via HEAD (léger, ~0 octet) à chaque ping.
+     * Tous les N pings (downlinkResampleEvery), fait un GET complet pour
+     * recalibrer le débit réel. Utilise Resource Timing API si disponible
+     * pour une mesure plus précise que le calcul maison.
+     *
+     * Économie : avec N=6 et interval=5s, ~1 GET pour 5 HEAD
+     * soit ~83% de data économisée vs toujours faire un GET.
      */
     private probe;
     private computeState;
     private computeFromEffectiveType;
     private notify;
     private get hasConnectionAPI();
+    private log;
 }
 export {};
 //# sourceMappingURL=NetworkMonitor.d.ts.map

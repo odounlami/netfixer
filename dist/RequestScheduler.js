@@ -1,9 +1,16 @@
-// --- Constantes ---
+// RequestScheduler.ts — v0.5.0
+// ─── Constantes ───────────────────────────────────────────────────────────────
 const DEFAULT_RULES = {
     good: ["critical", "normal", "background"],
     degraded: ["critical", "normal"],
     poor: ["critical"],
     offline: [],
+};
+// [Fix 2] Ordre numérique pour le tri du min-heap léger dans flush()
+const PRIORITY_ORDER = {
+    critical: 0,
+    normal: 1,
+    background: 2,
 };
 const DEFAULT_RETRYABLE_STATUSES = [429, 500, 502, 503, 504];
 const STORAGE_KEY = "netfixer:queue";
@@ -16,6 +23,7 @@ function computeBackoff(retries, initial, max) {
     const jitter = Math.random() * base * 0.2;
     return Math.round(base + jitter);
 }
+// ─── RequestScheduler ─────────────────────────────────────────────────────────
 export class RequestScheduler {
     monitor;
     queue = [];
@@ -27,6 +35,8 @@ export class RequestScheduler {
     persistEnabled;
     loggingEnabled;
     defaultMaxQueueAgeMs;
+    // [Fix 1] Set des IDs de requêtes actuellement en vol — anti double-envoi
+    inFlight = new Set();
     networkState;
     retryTimer = null;
     maxAgeTimer = null;
@@ -34,9 +44,9 @@ export class RequestScheduler {
     constructor(options) {
         this.monitor = options.monitor;
         this.networkState = this.monitor.getState();
-        this.initialBackoffMs = options.initialBackoffMs ?? 1000;
-        this.maxBackoffMs = options.maxBackoffMs ?? 30000;
-        this.defaultTimeoutMs = options.defaultTimeoutMs ?? 10000;
+        this.initialBackoffMs = options.initialBackoffMs ?? 1_000;
+        this.maxBackoffMs = options.maxBackoffMs ?? 30_000;
+        this.defaultTimeoutMs = options.defaultTimeoutMs ?? 10_000;
         this.retryableStatuses = options.retryableStatuses ?? DEFAULT_RETRYABLE_STATUSES;
         this.persistEnabled = options.persist ?? false;
         this.loggingEnabled = options.logging ?? false;
@@ -50,14 +60,12 @@ export class RequestScheduler {
         });
         this.maxAgeTimer = setInterval(() => {
             this.flushExpired();
-        }, 1000);
+        }, 1_000);
         if (this.persistEnabled) {
             this.restoreQueue();
         }
     }
-    /**
-     * Arrête le scheduler et nettoie les ressources.
-     */
+    /** Arrête le scheduler et nettoie les ressources. */
     destroy() {
         this.destroyed = true;
         if (this.retryTimer !== null) {
@@ -69,6 +77,18 @@ export class RequestScheduler {
             this.maxAgeTimer = null;
         }
     }
+    /**
+     * Envoie une requête en respectant les règles de priorité réseau.
+     *
+     * @remarks
+     * Si `persist: true` et que la page est rechargée, la promesse retournée
+     * par cet appel est perdue. La requête partira en arrière-plan au prochain
+     * démarrage, mais son résultat ne sera jamais accessible depuis le code appelant.
+     * Comportement intentionnel ("fire-and-forget persistant").
+     *
+     * Les requêtes avec un body non sérialisable (ReadableStream, fonctions)
+     * sont automatiquement dépersistées avec un avertissement de log.
+     */
     fetch(url, init = {}) {
         if (this.destroyed) {
             return Promise.reject(new Error("[netfixer] scheduler détruit"));
@@ -97,14 +117,29 @@ export class RequestScheduler {
             }
         });
     }
-    // --- File d'attente ---
+    // ─── File d'attente ───────────────────────────────────────────────────────
     enqueue(request) {
         if (this.destroyed)
             return;
+        // [Fix 4] Détecter les bodies non sérialisables avant de persister
+        if (request.persist && request.init.body !== undefined) {
+            const isNonSerializable = typeof request.init.body === "function" ||
+                request.init.body instanceof ReadableStream;
+            if (isNonSerializable) {
+                this.log(`[warn] persist:true avec un body non sérialisable sur ${request.url} ` +
+                    `— persistance désactivée pour cette requête`);
+                request.persist = false;
+            }
+        }
         this.queue.push(request);
         this.log(`[queued] ${request.url} — queue: ${this.queue.length}`);
         this.persistQueue();
     }
+    /**
+     * [Fix 2] flush() trié par priorité puis ancienneté (FIFO à priorité égale).
+     * Utilise splice(0) pour vider le tableau en une seule opération sans cloner.
+     * Évite aussi le double-déclenchement retry en annulant le timer existant.
+     */
     flush() {
         if (this.destroyed)
             return;
@@ -116,8 +151,11 @@ export class RequestScheduler {
             this.log(`[flush] skipped — network: ${this.networkState} — queue: ${this.queue.length}`);
             return;
         }
-        const pending = [...this.queue];
-        this.queue.length = 0;
+        // Trier : priorité d'abord (critical < normal < background), puis FIFO
+        this.queue.sort((a, b) => PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority] ||
+            a.queuedAt - b.queuedAt);
+        // splice(0) vide le tableau en place sans créer de copie intermédiaire
+        const pending = this.queue.splice(0);
         for (const request of pending) {
             if (this.canSend(request.priority)) {
                 this.log(`[flush] sending ${request.url} — network: ${this.networkState}`);
@@ -128,20 +166,17 @@ export class RequestScheduler {
             }
         }
         if (this.queue.length > 0) {
-            const maxRetries = Math.max(...this.queue.map((r) => r.retries));
+            const maxRetries = Math.max(...this.queue.map(r => r.retries));
             this.scheduleRetry(maxRetries);
         }
         this.persistQueue();
     }
-    /**
-     * Force l'envoi des requêtes qui ont dépassé leur maxQueueAgeMs.
-     */
+    /** Force l'envoi des requêtes qui ont dépassé leur maxQueueAgeMs. */
     flushExpired() {
         if (this.destroyed || this.queue.length === 0)
             return;
         const now = Date.now();
-        const pending = [...this.queue];
-        this.queue.length = 0;
+        const pending = this.queue.splice(0);
         for (const request of pending) {
             const age = now - request.queuedAt;
             const maxAge = request.maxQueueAgeMs;
@@ -171,12 +206,22 @@ export class RequestScheduler {
             this.flush();
         }, delay);
     }
-    // --- Envoi ---
+    // ─── Envoi ────────────────────────────────────────────────────────────────
+    /**
+     * [Fix 1] Guard inFlight : un même ID ne peut jamais être envoyé deux fois
+     * en parallèle, même si flush() et scheduleRetry() se déclenchent
+     * quasi simultanément sur un changement réseau.
+     */
     async send(request) {
         if (this.destroyed) {
             request.reject(new Error("[netfixer] scheduler détruit"));
             return;
         }
+        if (this.inFlight.has(request.id)) {
+            this.log(`[guard] ${request.url} (${request.id}) déjà en vol — doublon ignoré`);
+            return;
+        }
+        this.inFlight.add(request.id);
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), request.timeoutMs);
         try {
@@ -198,12 +243,16 @@ export class RequestScheduler {
                 this.log(`[timeout] ${request.url} — retry ${request.retries + 1}/${MAX_RETRIES} — network: ${this.networkState}`);
             }
             else {
-                this.log(`[error] ${request.url} — ${String(error)} — network: ${this.networkState}`);
+                // [Fix cosmétique] Distingue CORS/DNS des autres erreurs réseau
+                const tag = error instanceof TypeError ? "[error:network/CORS-or-DNS]" : "[error]";
+                this.log(`${tag} ${request.url} — ${String(error)} — network: ${this.networkState}`);
             }
             this.handleRetry(request, error);
         }
         finally {
             clearTimeout(timeout);
+            // [Fix 1] Libère le slot inFlight dans tous les cas
+            this.inFlight.delete(request.id);
         }
     }
     handleRetry(request, error) {
@@ -225,75 +274,97 @@ export class RequestScheduler {
     canSend(priority) {
         return this.rules[this.networkState].includes(priority);
     }
-    // --- Persistance ---
+    // ─── Fix 3 — Persistance avec fallback sessionStorage ────────────────────
+    /**
+     * Tente de persister dans localStorage d'abord, puis sessionStorage
+     * si localStorage est indisponible (quota dépassé, mode incognito strict…).
+     */
     persistQueue() {
         if (!this.persistEnabled)
             return;
-        try {
-            const serializable = this.queue
-                .filter((r) => r.persist)
-                .map(({ id, url, init, priority, timeoutMs, retries, queuedAt, maxQueueAgeMs }) => ({
-                id,
-                url,
-                init,
-                priority,
-                timeoutMs,
-                retries,
-                queuedAt,
-                maxQueueAgeMs,
-            }));
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable));
+        const serializable = this.queue
+            .filter(r => r.persist)
+            .map(({ id, url, init, priority, timeoutMs, retries, queuedAt, maxQueueAgeMs }) => ({
+            id, url, init, priority, timeoutMs, retries, queuedAt, maxQueueAgeMs,
+        }));
+        const data = JSON.stringify(serializable);
+        for (const storage of [localStorage, sessionStorage]) {
+            try {
+                storage.setItem(STORAGE_KEY, data);
+                return; // succès sur le premier storage disponible
+            }
+            catch (e) {
+                this.log(`[persist] échec sur ${storage === localStorage ? "localStorage" : "sessionStorage"} — ${String(e)}`);
+            }
         }
-        catch {
-            this.log("[persist] échec de la sauvegarde");
-        }
+        // Les deux ont échoué (incognito strict, quota dépassé partout)
+        this.log("[persist] aucun storage disponible — requêtes non persistées");
     }
     removePersisted(id) {
         if (!this.persistEnabled)
             return;
-        try {
-            const raw = localStorage.getItem(STORAGE_KEY);
-            if (!raw)
+        for (const storage of [localStorage, sessionStorage]) {
+            try {
+                const raw = storage.getItem(STORAGE_KEY);
+                if (!raw)
+                    continue;
+                const persisted = JSON.parse(raw);
+                storage.setItem(STORAGE_KEY, JSON.stringify(persisted.filter(r => r.id !== id)));
                 return;
-            const persisted = JSON.parse(raw);
-            const updated = persisted.filter((r) => r.id !== id);
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
-        }
-        catch {
-            this.log("[persist] échec de la suppression");
-        }
-    }
-    restoreQueue() {
-        try {
-            const raw = localStorage.getItem(STORAGE_KEY);
-            if (!raw)
-                return;
-            const persisted = JSON.parse(raw);
-            for (const item of persisted) {
-                const request = {
-                    id: item.id,
-                    url: item.url,
-                    init: item.init,
-                    priority: item.priority,
-                    timeoutMs: item.timeoutMs,
-                    persist: true,
-                    retries: item.retries,
-                    queuedAt: item.queuedAt,
-                    maxQueueAgeMs: item.maxQueueAgeMs,
-                    resolve: () => { },
-                    reject: () => { },
-                };
-                this.queue.push(request);
             }
-            this.log(`[restore] ${persisted.length} requête(s) restaurée(s) — network: ${this.networkState}`);
-            this.persistQueue();
-            this.flushExpired();
-            this.flush();
-        }
-        catch {
-            this.log("[restore] échec de la lecture");
+            catch {
+                this.log("[persist] échec de la suppression");
+            }
         }
     }
+    /**
+     * [Fix 3] Lit depuis localStorage d'abord, puis sessionStorage en fallback.
+     *
+     * [Fix 5] Les resolve/reject des requêtes restaurées sont des no-ops loggés.
+     * La promesse originale de l'appelant est perdue au reload — c'est le
+     * comportement "fire-and-forget persistant" documenté dans fetch().
+     */
+    restoreQueue() {
+        for (const storage of [localStorage, sessionStorage]) {
+            try {
+                const raw = storage.getItem(STORAGE_KEY);
+                if (!raw)
+                    continue;
+                const persisted = JSON.parse(raw);
+                for (const item of persisted) {
+                    const request = {
+                        id: item.id,
+                        url: item.url,
+                        init: item.init,
+                        priority: item.priority,
+                        timeoutMs: item.timeoutMs,
+                        persist: true,
+                        retries: item.retries,
+                        queuedAt: item.queuedAt,
+                        maxQueueAgeMs: item.maxQueueAgeMs,
+                        // [Fix 5] Callbacks explicitement documentés comme fire-and-forget
+                        resolve: () => {
+                            this.log(`[restore:resolve] ${item.url} livré après reload — résultat non accessible`);
+                        },
+                        reject: (reason) => {
+                            this.log(`[restore:reject] ${item.url} échoué après reload — ${String(reason)}`);
+                        },
+                    };
+                    this.queue.push(request);
+                }
+                this.log(`[restore] ${persisted.length} requête(s) restaurée(s) depuis ` +
+                    `${storage === localStorage ? "localStorage" : "sessionStorage"} — network: ${this.networkState}`);
+                this.persistQueue();
+                this.flushExpired();
+                this.flush();
+                return;
+            }
+            catch {
+                this.log("[restore] échec de lecture");
+            }
+        }
+    }
+    // ─── Utils ────────────────────────────────────────────────────────────────
     log(message) {
         if (this.loggingEnabled) {
             console.log(`[netfixer] ${message}`);

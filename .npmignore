@@ -1,0 +1,28 @@
+# Sources TypeScript — les utilisateurs reçoivent le dist compilé
+src/
+*.ts
+!*.d.ts
+
+# Config et tooling
+tsconfig*.json
+.eslintrc*
+.prettierrc*
+*.config.js
+*.config.ts
+scripts/
+
+# Tests
+**/*.test.*
+**/*.spec.*
+__tests__/
+coverage/
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Divers
+.env*
+*.log
+node_modules/
+.DS_Store
