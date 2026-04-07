@@ -1,4 +1,4 @@
-// NetworkMonitor.ts — v0.4.0
+// NetworkMonitor.ts — v0.5.0
 
 export type NetworkState = "good" | "degraded" | "poor" | "offline";
 
@@ -18,18 +18,27 @@ export interface NetworkThresholds {
 }
 
 export interface NetworkMonitorOptions {
-  pingUrl?:        string;
-  pingIntervalMs?: number;
-  pingTimeoutMs?:  number;
-  thresholds?:     Partial<NetworkThresholds>;
+  pingUrl?:              string;
+  pingIntervalMs?:       number;
+  pingTimeoutMs?:        number;
+  thresholds?:           Partial<NetworkThresholds>;
+  /**
+   * Active les logs de debug dans la console.
+   */
+  logging?:              boolean;
+  /**
+   * Nombre de pings HEAD consécutifs avant un GET complet (recalibrage du débit).
+   * Défaut : 6 — soit un GET toutes les 30s avec un interval de 5s.
+   */
+  downlinkResampleEvery?: number;
 }
 
 type Listener = (info: NetworkInfo) => void;
 
 interface NavigatorConnection {
-  downlink?:         number;
-  rtt?:              number;
-  effectiveType?:    string;
+  downlink?:            number;
+  rtt?:                 number;
+  effectiveType?:       string;
   addEventListener?:    (type: string, listener: EventListener) => void;
   removeEventListener?: (type: string, listener: EventListener) => void;
 }
@@ -69,8 +78,9 @@ class EWMABaseline {
 
 // ─── Constantes ───────────────────────────────────────────────────────────────
 
-const DEFAULT_PING_INTERVAL_MS = 5_000;
-const DEFAULT_PING_TIMEOUT_MS  = 5_000;
+const DEFAULT_PING_INTERVAL_MS     = 5_000;
+const DEFAULT_PING_TIMEOUT_MS      = 5_000;
+const DEFAULT_DOWNLINK_RESAMPLE    = 6;    // 1 GET pour 5 HEAD
 
 // 4 pings rapides au démarrage pour établir une baseline réelle en ~2s
 const WARMUP_COUNT       = 4;
@@ -98,29 +108,40 @@ export class NetworkMonitor {
   private isRunning           = false;
   private warmupDone          = false;
 
+  // [Fix 1] Guard anti race-condition
+  private isEvaluating         = false;
+  private evaluateDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
   private evaluationController: AbortController | null = null;
 
-  private readonly listeners = new Set<Listener>();
+  // [Fix 2] État du probe HEAD/GET hybride
+  private probeCount          = 0;
+  private lastKnownDownlink: number | null = null;
+  private readonly downlinkResampleEvery: number;
+
+  private readonly listeners  = new Set<Listener>();
   private pingInterval: ReturnType<typeof setInterval> | null = null;
   private readonly baseline   = new EWMABaseline();
   private readonly thresholds: NetworkThresholds;
+  private readonly loggingEnabled: boolean;
 
   private readonly pingUrl:        string;
   private readonly pingIntervalMs: number;
   private readonly pingTimeoutMs:  number;
 
-  private readonly onlineHandler           = () => { void this.evaluate(); };
-  private readonly offlineHandler          = () => { void this.evaluate(); };
-  private readonly connectionChangeHandler = () => { void this.evaluate(); };
+  // [Fix 1] Tous les handlers passent par scheduleEvaluate()
+  private readonly onlineHandler           = () => this.scheduleEvaluate();
+  private readonly offlineHandler          = () => this.scheduleEvaluate();
+  private readonly connectionChangeHandler = () => this.scheduleEvaluate();
 
   constructor(options: NetworkMonitorOptions = {}) {
-    this.pingUrl        = options.pingUrl        ?? "";
-    this.pingIntervalMs = options.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS;
-    this.pingTimeoutMs  = options.pingTimeoutMs  ?? DEFAULT_PING_TIMEOUT_MS;
-    this.thresholds     = { ...DEFAULT_THRESHOLDS, ...options.thresholds };
+    this.pingUrl               = options.pingUrl        ?? "";
+    this.pingIntervalMs        = options.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS;
+    this.pingTimeoutMs         = options.pingTimeoutMs  ?? DEFAULT_PING_TIMEOUT_MS;
+    this.thresholds            = { ...DEFAULT_THRESHOLDS, ...options.thresholds };
+    this.loggingEnabled        = options.logging        ?? false;
+    this.downlinkResampleEvery = options.downlinkResampleEvery ?? DEFAULT_DOWNLINK_RESAMPLE;
 
-    // Avertit si le navigateur ne supporte pas navigator.connection et qu'aucun
-    // ping n'est configuré — la détection sera inexacte sur Firefox et Safari
     if (!this.hasConnectionAPI && !this.pingUrl) {
       console.warn(
         "[netfixer] navigator.connection n'est pas disponible sur ce navigateur " +
@@ -144,18 +165,14 @@ export class NetworkMonitor {
     nav.connection?.addEventListener?.("change", this.connectionChangeHandler);
 
     if (this.pingUrl) {
-      // Warmup : 4 pings rapides pour avoir une baseline réelle en ~2s
-      // sur tous les navigateurs, y compris Firefox et Safari
       void this.runWarmup().then(() => {
-        this.warmupDone  = true;
-        // Intervalle normal après le warmup
+        this.warmupDone   = true;
         this.pingInterval = setInterval(
           () => { void this.evaluate(); },
           this.pingIntervalMs
         );
       });
     } else {
-      // Pas de ping configuré
       this.warmupDone = true;
       void this.evaluate();
     }
@@ -164,6 +181,12 @@ export class NetworkMonitor {
   stop(): void {
     if (!this.isRunning) return;
     this.isRunning = false;
+
+    // [Fix 1] Nettoie aussi le debounce timer
+    if (this.evaluateDebounceTimer !== null) {
+      clearTimeout(this.evaluateDebounceTimer);
+      this.evaluateDebounceTimer = null;
+    }
 
     this.evaluationController?.abort();
     this.evaluationController = null;
@@ -191,13 +214,24 @@ export class NetworkMonitor {
   getState(): NetworkState { return this.currentInfo.state; }
   getInfo():  NetworkInfo  { return { ...this.currentInfo }; }
 
-  // ─── Warmup ───────────────────────────────────────────────────────────────
+  // ─── Fix 1 — Debounce pour absorber les rafales d'events simultanés ───────
 
   /**
-   * Lance WARMUP_COUNT pings rapides espacés de WARMUP_INTERVAL_MS.
-   * Permet d'établir une baseline EWMA fiable en ~2s au lieu d'attendre
-   * le premier intervalle normal (5s par défaut).
+   * Point d'entrée unique pour tous les handlers d'événements.
+   * Absorbe les rafales (online + connection change simultanés) via un debounce 50ms.
    */
+  private scheduleEvaluate(): void {
+    if (this.evaluateDebounceTimer !== null) {
+      clearTimeout(this.evaluateDebounceTimer);
+    }
+    this.evaluateDebounceTimer = setTimeout(() => {
+      this.evaluateDebounceTimer = null;
+      void this.evaluate();
+    }, 50);
+  }
+
+  // ─── Warmup ───────────────────────────────────────────────────────────────
+
   private async runWarmup(): Promise<void> {
     for (let i = 0; i < WARMUP_COUNT; i++) {
       if (!this.isRunning) return;
@@ -214,7 +248,17 @@ export class NetworkMonitor {
 
   // ─── Évaluation ───────────────────────────────────────────────────────────
 
+  /**
+   * [Fix 1] Guard isEvaluating : empêche les évaluations concurrentes
+   * même si les AbortControllers annulent les requêtes fetch en vol.
+   */
   private async evaluate(): Promise<void> {
+    if (this.isEvaluating) {
+      this.log("[evaluate] déjà en cours — ignoré");
+      return;
+    }
+    this.isEvaluating = true;
+
     this.evaluationController?.abort();
     const controller = new AbortController();
     this.evaluationController = controller;
@@ -228,49 +272,68 @@ export class NetworkMonitor {
       const nav = navigator as NavigatorWithConnection;
 
       // Cas 1 — navigator.connection disponible + pas de ping configuré
-      // → comportement identique à v0.3, rien ne change pour Chrome/Edge
       if (this.hasConnectionAPI && !this.pingUrl) {
-        const downlink = nav.connection?.downlink ?? 10;
-        const latency  = nav.connection?.rtt      ?? 0;
-        const rtt      = latency;
-        const state    = this.computeState(latency, downlink);
-        this.notify({ state, latency, downlink, rtt }, controller);
+        // [Fix 3] try/catch + vérification isFinite sur chaque valeur
+        try {
+          const conn     = nav.connection;
+          const downlink = typeof conn?.downlink === "number" && isFinite(conn.downlink)
+            ? conn.downlink : 10;
+          const latency  = typeof conn?.rtt === "number" && isFinite(conn.rtt)
+            ? conn.rtt : 0;
+          const state    = this.computeState(latency, downlink);
+          this.notify({ state, latency, downlink, rtt: latency }, controller);
+        } catch {
+          // API instable sur navigateur exotique → défensif
+          this.notify({ state: "poor", latency: Infinity, downlink: 0, rtt: 0 }, controller);
+        }
         return;
       }
 
       // Cas 2 — ping configuré (tous navigateurs)
-      // ou pas de navigator.connection (Firefox, Safari sans ping)
       if (this.pingUrl) {
         const { latency, downlink } = await this.probe(controller.signal);
         if (controller.signal.aborted) return;
 
-        // On complète rtt avec l'API si dispo, sinon on utilise la latence mesurée
-        const rtt   = nav.connection?.rtt ?? latency;
+        const rtt   = (() => {
+          try {
+            const conn = nav.connection;
+            return typeof conn?.rtt === "number" && isFinite(conn.rtt)
+              ? conn.rtt : latency;
+          } catch {
+            return latency;
+          }
+        })();
+
         const state = this.computeState(latency, downlink);
         this.notify({ state, latency, downlink, rtt }, controller);
         return;
       }
 
       // Cas 3 — pas de navigator.connection ET pas de ping
-      // → poor défensif jusqu'à ce que l'API soit disponible
       this.notify({ state: "poor", latency: Infinity, downlink: 0, rtt: 0 }, controller);
 
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
-      throw error;
+      this.log(`[evaluate] erreur inattendue — ${String(error)}`);
     } finally {
+      // [Fix 1] Libère toujours le verrou
+      this.isEvaluating = false;
       if (this.evaluationController === controller) {
         this.evaluationController = null;
       }
     }
   }
 
-  // ─── Probe ────────────────────────────────────────────────────────────────
+  // ─── Fix 2 — Probe HEAD/GET hybride ──────────────────────────────────────
 
   /**
-   * Mesure latence (TTFB) et débit réel en une seule requête GET.
-   * Universel — fonctionne sur tous les navigateurs sans navigator.connection.
-   * L'endpoint doit servir un fichier statique léger (1–20 KB) avec CORS configuré.
+   * Mesure la latence via HEAD (léger, ~0 octet) à chaque ping.
+   * Tous les N pings (downlinkResampleEvery), fait un GET complet pour
+   * recalibrer le débit réel. Utilise Resource Timing API si disponible
+   * pour une mesure plus précise que le calcul maison.
+   *
+   * Économie : avec N=6 et interval=5s, ~1 GET pour 5 HEAD
+   * soit ~83% de data économisée vs toujours faire un GET.
    */
   private async probe(signal: AbortSignal): Promise<{ latency: number; downlink: number }> {
     const controller = new AbortController();
@@ -280,30 +343,73 @@ export class NetworkMonitor {
     const url = new URL(this.pingUrl, window.location.origin);
     url.searchParams.set("t", Date.now().toString());
 
+    const needsDownlink = (this.probeCount % this.downlinkResampleEvery) === 0;
+    this.probeCount++;
+
     const start = performance.now();
 
     try {
+      if (!needsDownlink) {
+        // HEAD : latence seule, aucun body téléchargé
+        await fetch(url.toString(), {
+          method: "HEAD",
+          cache:  "no-store",
+          signal: controller.signal,
+        });
+        const latency = Math.round(performance.now() - start);
+        this.log(`[probe:HEAD] latency=${latency}ms — downlink réutilisé: ${this.lastKnownDownlink ?? 0} Mbps`);
+        return { latency, downlink: this.lastKnownDownlink ?? 0 };
+      }
+
+      // GET complet pour mesurer le débit
       const response = await fetch(url.toString(), {
-        method: "GET",       // GET pour avoir un body mesurable (HEAD = 0 octet)
+        method: "GET",
         cache:  "no-store",
         signal: controller.signal,
       });
-
       const ttfb   = Math.round(performance.now() - start);
       const buffer = await response.arrayBuffer();
       const bytes  = buffer.byteLength;
 
-      const totalMs  = performance.now() - start;
-      const transfer = totalMs - ttfb; // temps de transfert seul, hors latence
+      // Préfère Resource Timing API (plus précis que le calcul maison)
+      let downlink = 0;
+      try {
+        const entries = performance.getEntriesByType("resource") as PerformanceResourceTiming[];
+        const entry   = entries.findLast(e => e.name.startsWith(url.origin + url.pathname));
+        if (entry && entry.transferSize > 0) {
+          const transferMs = entry.responseEnd - entry.requestStart;
+          downlink = transferMs > 0
+            ? parseFloat(((entry.transferSize * 8) / (transferMs * 1000)).toFixed(2))
+            : 0;
+          this.log(`[probe:GET:ResourceTiming] ttfb=${ttfb}ms — downlink=${downlink}Mbps`);
+        }
+      } catch {
+        // Resource Timing non disponible ou bloqué par Timing-Allow-Origin
+      }
 
-      // Mbps = (bytes × 8) / (ms × 1000)
-      const downlink = transfer > 0 && bytes > 0
-        ? parseFloat(((bytes * 8) / (transfer * 1000)).toFixed(2))
-        : 0;
+      // Fallback calcul maison si Resource Timing n'a rien donné
+      if (downlink === 0) {
+        const totalMs  = performance.now() - start;
+        const transfer = totalMs - ttfb;
+        downlink = transfer > 0 && bytes > 0
+          ? parseFloat(((bytes * 8) / (transfer * 1000)).toFixed(2))
+          : 0;
+        this.log(`[probe:GET:fallback] ttfb=${ttfb}ms — downlink=${downlink}Mbps`);
+      }
 
+      this.lastKnownDownlink = downlink;
       return { latency: ttfb, downlink };
 
-    } catch {
+    } catch (error: unknown) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        return { latency: Infinity, downlink: 0 };
+      }
+      // [Fix 4] Log structuré par type d'erreur réseau
+      if (error instanceof TypeError) {
+        this.log("[probe] erreur réseau (CORS ou DNS) — " + String(error));
+      } else {
+        this.log("[probe] erreur inconnue — " + String(error));
+      }
       return { latency: Infinity, downlink: 0 };
     } finally {
       clearTimeout(timeout);
@@ -336,16 +442,25 @@ export class NetworkMonitor {
   }
 
   private computeFromEffectiveType(latency: number): NetworkState {
-    const nav  = navigator as NavigatorWithConnection;
-    const type = nav.connection?.effectiveType;
+    // [Fix 3] try/catch au cas où l'accès à connection plante
+    try {
+      const nav  = navigator as NavigatorWithConnection;
+      const type = nav.connection?.effectiveType;
 
-    if (type === "4g" && latency < this.thresholds.maxLatency) return "good";
-    if (type === "3g")                                          return "degraded";
-    if (type === "2g" || type === "slow-2g")                   return "poor";
+      if (type === "4g" && latency < this.thresholds.maxLatency) return "good";
+      if (type === "3g")                                          return "degraded";
+      if (type === "2g" || type === "slow-2g")                   return "poor";
 
-    const downlink = nav.connection?.downlink ?? 0;
-    if (downlink > this.thresholds.absoluteGood && latency < this.thresholds.maxLatency) return "good";
-    if (downlink > this.thresholds.absolutePoor)                                         return "degraded";
+      const downlink = (() => {
+        const d = nav.connection?.downlink;
+        return typeof d === "number" && isFinite(d) ? d : 0;
+      })();
+
+      if (downlink > this.thresholds.absoluteGood && latency < this.thresholds.maxLatency) return "good";
+      if (downlink > this.thresholds.absolutePoor)                                         return "degraded";
+    } catch {
+      this.log("[computeFromEffectiveType] navigator.connection inaccessible");
+    }
     return "poor";
   }
 
@@ -378,5 +493,11 @@ export class NetworkMonitor {
 
   private get hasConnectionAPI(): boolean {
     return "connection" in navigator;
+  }
+
+  private log(message: string): void {
+    if (this.loggingEnabled) {
+      console.log(`[netfixer] ${message}`);
+    }
   }
 }
