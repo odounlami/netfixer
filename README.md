@@ -332,54 +332,6 @@ If you need guaranteed delivery with conflict handling, look at those instead.
 
 ---
 
-## Publishing to npm
-
-> Run these commands from the root of your project.
-
-**1. Make sure you're logged in:**
-
-```bash
-npm login
-```
-
-**2. Build your TypeScript:**
-
-```bash
-tsc
-```
-
-**3. Check what will be published:**
-
-```bash
-npm pack --dry-run
-```
-
-Make sure only `dist/`, `README.md`, and `LICENSE` are included. If needed, add a `.npmignore` or verify the `files` field in your `package.json`:
-
-```json
-{
-  "files": ["dist", "README.md", "LICENSE"]
-}
-```
-
-**4. Publish:**
-
-```bash
-npm publish --access public
-```
-
-**5. For subsequent releases**, bump the version first:
-
-```bash
-npm version patch   # 0.5.0 → 0.5.1  (bug fix)
-npm version minor   # 0.5.0 → 0.6.0  (new feature)
-npm version major   # 0.5.0 → 1.0.0  (breaking change)
-
-npm publish --access public
-```
-
----
-
 ## License
 
 MIT
