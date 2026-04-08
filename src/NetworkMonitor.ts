@@ -1,4 +1,4 @@
-// NetworkMonitor.ts — v0.5.0
+// NetworkMonitor.ts — v0.5.1
 
 export type NetworkState = "good" | "degraded" | "poor" | "offline";
 
@@ -27,8 +27,9 @@ export interface NetworkMonitorOptions {
    */
   logging?:              boolean;
   /**
-   * Nombre de pings HEAD consécutifs avant un GET complet (recalibrage du débit).
-   * Défaut : 6 — soit un GET toutes les 30s avec un interval de 5s.
+   * Nombre de probes consécutives avant un GET complet (recalibrage du débit).
+   * Défaut : 6 — soit 1 GET toutes les 6 probes (≈ 5 HEAD + 1 GET).
+   * Avec un interval de 5s, cela représente ~1 GET toutes les 30s.
    */
   downlinkResampleEvery?: number;
 }
@@ -78,9 +79,11 @@ class EWMABaseline {
 
 // ─── Constantes ───────────────────────────────────────────────────────────────
 
-const DEFAULT_PING_INTERVAL_MS     = 5_000;
-const DEFAULT_PING_TIMEOUT_MS      = 5_000;
-const DEFAULT_DOWNLINK_RESAMPLE    = 6;    // 1 GET pour 5 HEAD
+const DEFAULT_PING_INTERVAL_MS  = 5_000;
+const DEFAULT_PING_TIMEOUT_MS   = 5_000;
+
+// [Fix P5] Commentaire précisé : 1 GET toutes les 6 probes (≈ 5 HEAD + 1 GET)
+const DEFAULT_DOWNLINK_RESAMPLE = 6; // 1 GET toutes les 6 probes (≈ 5 HEAD + 1 GET)
 
 // 4 pings rapides au démarrage pour établir une baseline réelle en ~2s
 const WARMUP_COUNT       = 4;
@@ -294,7 +297,7 @@ export class NetworkMonitor {
         const { latency, downlink } = await this.probe(controller.signal);
         if (controller.signal.aborted) return;
 
-        const rtt   = (() => {
+        const rtt = (() => {
           try {
             const conn = nav.connection;
             return typeof conn?.rtt === "number" && isFinite(conn.rtt)
@@ -418,28 +421,31 @@ export class NetworkMonitor {
 
   // ─── Calcul d'état — sans side-effect ─────────────────────────────────────
 
-  private computeState(latency: number, downlink: number): NetworkState {
-    if (!Number.isFinite(latency)) return "poor";
+private computeState(latency: number, downlink: number): NetworkState {
+  if (!Number.isFinite(latency)) return "poor";
 
-    if (downlink > this.thresholds.absoluteGood && latency < this.thresholds.maxLatency) {
-      return "good";
-    }
-
-    if (downlink < this.thresholds.absolutePoor) return "poor";
-
+  if (Number.isFinite(downlink) && downlink > 0) {
     this.baseline.update(downlink);
-    const base = this.baseline.getBaseline();
-
-    if (base === null || base === 0) {
-      return this.computeFromEffectiveType(latency);
-    }
-
-    const ratio = downlink / base;
-
-    if (ratio > this.thresholds.ratioGood    && latency < this.thresholds.maxLatency) return "good";
-    if (ratio > this.thresholds.ratioDegraded)                                        return "degraded";
-    return "poor";
   }
+
+  if (downlink > this.thresholds.absoluteGood && latency < this.thresholds.maxLatency) {
+    return "good";
+  }
+
+  if (downlink < this.thresholds.absolutePoor) return "poor";
+
+  const base = this.baseline.getBaseline();
+
+  if (base === null || base === 0) {
+    return this.computeFromEffectiveType(latency);
+  }
+
+  const ratio = downlink / base;
+
+  if (ratio > this.thresholds.ratioGood && latency < this.thresholds.maxLatency) return "good";
+  if (ratio > this.thresholds.ratioDegraded) return "degraded";
+  return "poor";
+}
 
   private computeFromEffectiveType(latency: number): NetworkState {
     // [Fix 3] try/catch au cas où l'accès à connection plante

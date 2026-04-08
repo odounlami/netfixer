@@ -1,6 +1,6 @@
 {
   "name": "netfixer",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Adaptive network-aware request scheduler for the web",
   "type": "module",
   "main": "./dist/index.js",

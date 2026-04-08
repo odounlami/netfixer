@@ -22,8 +22,9 @@ export interface NetworkMonitorOptions {
      */
     logging?: boolean;
     /**
-     * Nombre de pings HEAD consécutifs avant un GET complet (recalibrage du débit).
-     * Défaut : 6 — soit un GET toutes les 30s avec un interval de 5s.
+     * Nombre de probes consécutives avant un GET complet (recalibrage du débit).
+     * Défaut : 6 — soit 1 GET toutes les 6 probes (≈ 5 HEAD + 1 GET).
+     * Avec un interval de 5s, cela représente ~1 GET toutes les 30s.
      */
     downlinkResampleEvery?: number;
 }

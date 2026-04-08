@@ -1,4 +1,4 @@
-// NetworkMonitor.ts — v0.5.0
+// NetworkMonitor.ts — v0.5.1
 // ─── EWMA ─────────────────────────────────────────────────────────────────────
 const ALPHA = 0.15;
 const MIN_SAMPLES = 4;
@@ -26,7 +26,8 @@ class EWMABaseline {
 // ─── Constantes ───────────────────────────────────────────────────────────────
 const DEFAULT_PING_INTERVAL_MS = 5_000;
 const DEFAULT_PING_TIMEOUT_MS = 5_000;
-const DEFAULT_DOWNLINK_RESAMPLE = 6; // 1 GET pour 5 HEAD
+// [Fix P5] Commentaire précisé : 1 GET toutes les 6 probes (≈ 5 HEAD + 1 GET)
+const DEFAULT_DOWNLINK_RESAMPLE = 6; // 1 GET toutes les 6 probes (≈ 5 HEAD + 1 GET)
 // 4 pings rapides au démarrage pour établir une baseline réelle en ~2s
 const WARMUP_COUNT = 4;
 const WARMUP_INTERVAL_MS = 500;
@@ -321,12 +322,14 @@ export class NetworkMonitor {
     computeState(latency, downlink) {
         if (!Number.isFinite(latency))
             return "poor";
+        if (Number.isFinite(downlink) && downlink > 0) {
+            this.baseline.update(downlink);
+        }
         if (downlink > this.thresholds.absoluteGood && latency < this.thresholds.maxLatency) {
             return "good";
         }
         if (downlink < this.thresholds.absolutePoor)
             return "poor";
-        this.baseline.update(downlink);
         const base = this.baseline.getBaseline();
         if (base === null || base === 0) {
             return this.computeFromEffectiveType(latency);
