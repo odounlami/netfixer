@@ -335,3 +335,14 @@ If you need guaranteed delivery with conflict handling, look at those instead.
 ## License
 
 MIT
+
+## Development checks
+
+Run the TypeScript build and the automated scheduler tests with:
+
+```bash
+npm install
+npm test
+```
+
+The tests cover queuing while offline, resuming queued requests after network recovery, and rejecting pending requests when the scheduler is destroyed.
