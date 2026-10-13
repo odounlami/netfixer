@@ -29,8 +29,5 @@
   "license": "MIT",
   "devDependencies": {
     "typescript": "^5.0.0"
-  },
-  "dependencies": {
-    "netfixer": "^0.5.0"
   }
 }
